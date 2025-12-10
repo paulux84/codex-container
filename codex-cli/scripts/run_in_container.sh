@@ -20,6 +20,17 @@ WORKDIR_CODEX_DIR=""
 CONFIG_SOURCE_DIR=""
 HOST_ALLOWED_DOMAINS_FILE=""
 MERGED_OPENAI_ALLOWED_DOMAINS=()
+PROXY_IP_V4="${PROXY_IP_V4:-}"
+PROXY_IP_V6="${PROXY_IP_V6:-}"
+PROXY_PORT="${PROXY_PORT:-3128}"
+PROXY_NO_PROXY_DEFAULT="localhost,127.0.0.1,::1"
+PROXY_NO_PROXY="${NO_PROXY:-$PROXY_NO_PROXY_DEFAULT}"
+SQUID_DOCKER_IMAGE="${SQUID_DOCKER_IMAGE:-ubuntu/squid:latest}"
+AUTO_SQUID=false
+SQUID_CONTAINER_NAME=""
+SQUID_CONFIG_DIR=""
+DOCKER_NETWORK_NAME=""
+NETWORK_CREATED=false
 
 get_latest_codex_version() {
   if ! command -v npm >/dev/null 2>&1; then
@@ -81,12 +92,19 @@ merge_allowed_domains() {
   local __USER_DOMAINS=()
   declare -A __SEEN_DOMAINS=()
   MERGED_OPENAI_ALLOWED_DOMAINS=()
+  local defaults_added=false
 
-  for domain in "${DEFAULT_OPENAI_ALLOWED_DOMAINS[@]}"; do
-    if [[ -n "$domain" && -z "${__SEEN_DOMAINS[$domain]+isset}" ]]; then
-      MERGED_OPENAI_ALLOWED_DOMAINS+=("$domain")
-      __SEEN_DOMAINS[$domain]=1
+  add_domain() {
+    local d="$1"
+    if [[ -n "$d" && -z "${__SEEN_DOMAINS[$d]+isset}" ]]; then
+      MERGED_OPENAI_ALLOWED_DOMAINS+=("$d")
+      __SEEN_DOMAINS[$d]=1
     fi
+  }
+
+  # Always include defaults first
+  for domain in "${DEFAULT_OPENAI_ALLOWED_DOMAINS[@]}"; do
+    add_domain "$domain"
   done
 
   if [[ -n "$allowed_domains_file" && -e "$allowed_domains_file" ]]; then
@@ -102,25 +120,28 @@ merge_allowed_domains() {
         if [[ "$domain" == \#* ]]; then
           break
         fi
-        if [[ -n "$domain" && -z "${__SEEN_DOMAINS[$domain]+isset}" ]]; then
-          MERGED_OPENAI_ALLOWED_DOMAINS+=("$domain")
-          __SEEN_DOMAINS[$domain]=1
-        fi
+        add_domain "$domain"
       done
     done <"$allowed_domains_file"
+    defaults_added=true
   fi
 
   if [[ -n "$OPENAI_ALLOWED_DOMAINS_ENV" ]]; then
     read -r -a __USER_DOMAINS <<<"$OPENAI_ALLOWED_DOMAINS_ENV"
     for domain in "${__USER_DOMAINS[@]}"; do
-      if [[ -n "$domain" && -z "${__SEEN_DOMAINS[$domain]+isset}" ]]; then
-        MERGED_OPENAI_ALLOWED_DOMAINS+=("$domain")
-        __SEEN_DOMAINS[$domain]=1
-      fi
+      add_domain "$domain"
     done
   fi
 
   OPENAI_ALLOWED_DOMAINS="${MERGED_OPENAI_ALLOWED_DOMAINS[*]}"
+
+  if [[ -e "$allowed_domains_file" && "$defaults_added" == true ]]; then
+    echo "Using default allowed domains merged with $allowed_domains_file (plus OPENAI_ALLOWED_DOMAINS env if set)"
+  elif [[ "$defaults_added" == true ]]; then
+    echo "Using default allowed domains merged with $allowed_domains_file (file empty or had no entries)"
+  else
+    echo "Using default allowed domains (no file provided)"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -201,6 +222,10 @@ if ! WORK_DIR=$(realpath "$WORK_DIR"); then
   exit 1
 fi
 
+# Derive deterministic network and squid container names based on workdir
+DOCKER_NETWORK_NAME="codex_net_$(echo "$WORK_DIR" | sha1sum | cut -c1-8)"
+SQUID_CONTAINER_NAME="codex_squid_$(echo "$WORK_DIR" | sha1sum | cut -c1-8)"
+
 if [[ "$WORK_DIR" == "/" ]]; then
   echo "Error: refusing to use / as work directory."
   exit 1
@@ -249,13 +274,19 @@ else
   CODEX_DATA_DIR="$WORK_DIR/.codex"
 fi
 
-HOST_ALLOWED_DOMAINS_FILE="$CODEX_DATA_DIR/allowed_domains.txt"
-merge_allowed_domains "$HOST_ALLOWED_DOMAINS_FILE"
+# Proxy defaults: if not provided, we will auto-start a Squid container
+if [[ -z "$PROXY_IP_V4" && -z "$PROXY_IP_V6" ]]; then
+  AUTO_SQUID=true
+fi
 
-if [[ -z "$OPENAI_ALLOWED_DOMAINS" ]]; then
-  echo "Error: OPENAI_ALLOWED_DOMAINS is empty."
+if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]]; then
+  echo "Error: PROXY_PORT must be numeric (got '$PROXY_PORT')."
   exit 1
 fi
+
+PROXY_URL_V4=""
+PROXY_URL_V6=""
+PROXY_URL=""
 
 READ_ONLY_PATHS_ABS=()
 for path in "${READ_ONLY_PATHS[@]}"; do
@@ -299,6 +330,17 @@ RESOLVED_DOCKER_IMAGE="$IMAGE_REPO:$TARGET_CODEX_VERSION"
 
 ensure_image_with_version "$RESOLVED_DOCKER_IMAGE" "$TARGET_CODEX_VERSION" "$LATEST_REQUESTED" "$ALLOW_REMOTE_IMAGE_PULL"
 
+ensure_network() {
+  if docker network inspect "$DOCKER_NETWORK_NAME" >/dev/null 2>&1; then
+    return
+  fi
+  docker network create "$DOCKER_NETWORK_NAME" >/dev/null
+  NETWORK_CREATED=true
+}
+
+# Ensure dedicated network exists (first pass)
+ensure_network
+
 # Prepare environment directory under chosen codex dir for init artifacts
 ENV_DIR="$CODEX_DATA_DIR/.environment"
 if ! mkdir -p "$ENV_DIR"; then
@@ -309,6 +351,15 @@ fi
 # Prepare Codex config directory inside environment and clone host config if missing
 WORKDIR_CODEX_DIR="$CODEX_DATA_DIR"
 mkdir -p "$WORKDIR_CODEX_DIR"
+
+# Merge allowed domains (host file lives in ENV_DIR)
+HOST_ALLOWED_DOMAINS_FILE="$ENV_DIR/allowed_domains.txt"
+merge_allowed_domains "$HOST_ALLOWED_DOMAINS_FILE"
+
+if [[ -z "$OPENAI_ALLOWED_DOMAINS" ]]; then
+  echo "Error: OPENAI_ALLOWED_DOMAINS is empty."
+  exit 1
+fi
 
 CONFIG_SOURCE_DIR=""
 CONFIG_DIR_CANDIDATES=(
@@ -428,14 +479,26 @@ CONTAINER_NAME="codex_$(echo "$WORK_DIR" | sed 's:/:_:g' | sed 's/[^a-zA-Z0-9_-]
 
 cleanup() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  if [[ -n "$SQUID_CONTAINER_NAME" ]]; then
+    docker rm -f "$SQUID_CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+  if $NETWORK_CREATED; then
+    docker network rm "$DOCKER_NETWORK_NAME" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${ALLOWED_DOMAINS_DIR:-}" && -d "$ALLOWED_DOMAINS_DIR" ]]; then
     rm -rf "$ALLOWED_DOMAINS_DIR" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SQUID_CONFIG_DIR:-}" && -d "$SQUID_CONFIG_DIR" ]]; then
+    rm -rf "$SQUID_CONFIG_DIR" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
 # Remove any existing container for this workdir
 cleanup
+
+# Ensure network exists after cleanup in case it was removed by a previous run
+ensure_network
 
 ALLOWED_DOMAINS_DIR="$(mktemp -d)"
 ALLOWED_DOMAINS_FILE="$ALLOWED_DOMAINS_DIR/allowed_domains.txt"
@@ -447,9 +510,79 @@ for domain in $OPENAI_ALLOWED_DOMAINS; do
   echo "$domain" >>"$ALLOWED_DOMAINS_FILE"
 done
 
+if $AUTO_SQUID; then
+  SQUID_CONFIG_DIR="$(mktemp -d)"
+  SQUID_CONF_PATH="$SQUID_CONFIG_DIR/squid.conf"
+  cat >"$SQUID_CONF_PATH" <<EOF
+http_port ${PROXY_PORT}
+visible_hostname codex-squid
+
+acl allowed_sites dstdomain "/etc/codex/allowed_domains.txt"
+acl CONNECT method CONNECT
+acl SSL_ports port 443
+
+http_access deny CONNECT !SSL_ports
+http_access deny CONNECT !allowed_sites
+http_access allow CONNECT allowed_sites
+http_access allow allowed_sites
+http_access deny all
+EOF
+
+  # (Re)start Squid container on the dedicated network
+  docker rm -f "$SQUID_CONTAINER_NAME" >/dev/null 2>&1 || true
+  ensure_network
+  docker run -d \
+    --name "$SQUID_CONTAINER_NAME" \
+    --network "$DOCKER_NETWORK_NAME" \
+    -v "$SQUID_CONF_PATH:/etc/squid/squid.conf:ro" \
+    -v "$ALLOWED_DOMAINS_DIR:/etc/codex:ro" \
+    "$SQUID_DOCKER_IMAGE" >/dev/null
+
+  # Give Squid a moment to start
+  sleep 2
+
+  PROXY_IP_V4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$SQUID_CONTAINER_NAME")"
+  if [[ -z "$PROXY_IP_V4" ]]; then
+    echo "Error: Unable to determine Squid container IP (IPv4)."
+    docker ps -a --filter "name=${SQUID_CONTAINER_NAME}" || true
+    docker logs "$SQUID_CONTAINER_NAME" || true
+    exit 1
+  fi
+
+  PROXY_URL_V4="http://${PROXY_IP_V4}:${PROXY_PORT}"
+  PROXY_URL="$PROXY_URL_V4"
+fi
+
+if [[ -z "$PROXY_URL" ]]; then
+  if [[ -n "$PROXY_IP_V4" ]]; then
+    PROXY_URL_V4="http://${PROXY_IP_V4}:${PROXY_PORT}"
+    PROXY_URL="$PROXY_URL_V4"
+  elif [[ -n "$PROXY_IP_V6" ]]; then
+    PROXY_URL_V6="http://[${PROXY_IP_V6}]:${PROXY_PORT}"
+    PROXY_URL="$PROXY_URL_V6"
+  fi
+fi
+
+if [[ -z "$PROXY_URL" ]]; then
+  echo "Error: Unable to determine proxy URL."
+  exit 1
+fi
+
+PROXY_CONFIG_FILE="$ALLOWED_DOMAINS_DIR/proxy.conf"
+{
+  if [[ -n "$PROXY_IP_V4" ]]; then
+    echo "PROXY_IP_V4=$PROXY_IP_V4"
+  fi
+  if [[ -n "$PROXY_IP_V6" ]]; then
+    echo "PROXY_IP_V6=$PROXY_IP_V6"
+  fi
+  echo "PROXY_PORT=$PROXY_PORT"
+} >"$PROXY_CONFIG_FILE"
+
 DOCKER_RUN_ARGS=(
   --name "$CONTAINER_NAME"
   -d
+  --network "$DOCKER_NETWORK_NAME"
   --cap-drop=ALL
   --security-opt no-new-privileges
   -v "$WORK_DIR:/app$WORK_DIR"
@@ -458,6 +591,10 @@ DOCKER_RUN_ARGS=(
 DOCKER_RUN_ARGS+=(-v "$CODEX_HOME_DIR:/codex_home")
 DOCKER_RUN_ARGS+=(-e "CODEX_HOME=/codex_home")
 DOCKER_RUN_ARGS+=(--mount "type=bind,src=$SESSIONS_PATH_ABS,dst=/codex_home/sessions")
+
+if [[ -n "$PROXY_URL" ]]; then
+  DOCKER_RUN_ARGS+=(-e "HTTP_PROXY=$PROXY_URL" -e "HTTPS_PROXY=$PROXY_URL" -e "NO_PROXY=$PROXY_NO_PROXY")
+fi
 
 for ro_path in "${READ_ONLY_PATHS_ABS[@]}"; do
   DOCKER_RUN_ARGS+=(--mount "type=bind,src=$ro_path,dst=/app$ro_path,ro")
@@ -476,6 +613,17 @@ docker run --rm \
   --entrypoint bash \
   "$RESOLVED_DOCKER_IMAGE" \
   -c "/usr/local/bin/init_firewall.sh"
+
+firewall_status=$?
+if [[ $firewall_status -ne 0 ]]; then
+  echo "Firewall init failed with status $firewall_status"
+  if $AUTO_SQUID && docker ps -a --format '{{.Names}}' | grep -q "^${SQUID_CONTAINER_NAME}$"; then
+    echo "--- Squid logs ($SQUID_CONTAINER_NAME) ---"
+    docker logs "$SQUID_CONTAINER_NAME" || true
+    echo "--- End Squid logs ---"
+  fi
+  exit $firewall_status
+fi
 
 # Quote Codex args (if any)
 quoted_args=""
