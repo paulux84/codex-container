@@ -1,0 +1,49 @@
+ARG NODE_VERSION=22
+FROM node:${NODE_VERSION}-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG CODEX_VERSION=latest
+
+# System dependencies and networking tools
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git \
+      curl \
+      dnsutils \
+      ca-certificates \
+      iptables \
+      iproute2 \
+      ipset && \
+    rm -rf /var/lib/apt/lists/*
+
+# npm global directory with friendly permissions
+ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
+ENV PATH=$PATH:/usr/local/share/npm-global/bin
+RUN mkdir -p "$NPM_CONFIG_PREFIX" && chown -R 1000:1000 "$NPM_CONFIG_PREFIX"
+
+# Install Codex CLI globally (version can be pinned with CODEX_VERSION)
+RUN npm install -g "@openai/codex@${CODEX_VERSION}" && \
+    chown -R 1000:1000 "$NPM_CONFIG_PREFIX"
+
+# Copy firewall script into PATH
+COPY init_firewall.sh /usr/local/bin/init_firewall.sh
+RUN chmod +x /usr/local/bin/init_firewall.sh
+
+# Create non-root user (reuse UID 1000 if already present, e.g. node user in base image)
+RUN if id -u codex >/dev/null 2>&1; then \
+      : ; \
+    elif id -u 1000 >/dev/null 2>&1; then \
+      existing_user="$(getent passwd 1000 | cut -d: -f1)"; \
+      usermod -l codex "$existing_user" && groupmod -n codex "$existing_user"; \
+      usermod -d /home/codex -m codex; \
+    else \
+      useradd -m -u 1000 -s /bin/bash codex; \
+    fi
+
+ENV XDG_CONFIG_HOME=/home/codex/.config
+WORKDIR /workspace
+
+USER codex
+
+# Default command; run_in_container.sh will override with `sleep infinity`
+CMD [ "bash" ]
