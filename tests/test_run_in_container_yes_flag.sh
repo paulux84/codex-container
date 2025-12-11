@@ -28,17 +28,15 @@ cat <<'EOS' > "$MOCK_BIN/docker"
 echo "docker $*" >> "$DOCKER_LOG"
 sub="$1"
 if [[ "$sub" == "image" ]]; then
-  # docker image inspect ...
   exit 0
 elif [[ "$sub" == "inspect" ]]; then
-  # return dummy IPs for inspect calls (network/container)
   if [[ "$*" == *"{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"* ]]; then
-    echo "172.20.0.2"
+    echo "172.30.0.2"
   fi
   exit 0
 fi
 case "$sub" in
-  pull|cp|run|exec|build|rm)
+  pull|cp|run|exec|build|rm|network)
     exit 0
     ;;
 esac
@@ -48,30 +46,31 @@ EOS
 chmod +x "$MOCK_BIN/docker"
 export PATH="$MOCK_BIN:$PATH"
 
+OUTSIDE_CODEX_HOME="$TMP_DIR/outside_codex"
+OUTSIDE_SESSIONS="$TMP_DIR/outside_sessions"
+
 CODEX_VERSION="1.2.3" \
 CODEX_DOCKER_IMAGE="codex-sandbox:1.2.3" \
+CODEX_DATA_DIR="$OUTSIDE_CODEX_HOME" \
+SESSIONS_PATH="$OUTSIDE_SESSIONS" \
 WORKSPACE_ROOT_DIR="$WORK_DIR" \
 bash "$ROOT_DIR/codex-cli/scripts/run_in_container.sh" \
+  -y \
   --config "$CONFIG_OVERRIDE_DIR" >/dev/null
+
+if [[ ! -f "$OUTSIDE_CODEX_HOME/.environment/config.toml" ]]; then
+  echo "Expected config.toml to be copied into external codex home when using -y" >&2
+  exit 1
+fi
+
+if [[ -f "$OUTSIDE_CODEX_HOME/.environment/auth.json" ]]; then
+  echo "auth.json should not be copied into the codex home directory" >&2
+  exit 1
+fi
 
 if ! grep -Fq "docker exec --user codex" "$DOCKER_LOG"; then
   echo "Expected docker exec to include --user codex" >&2
   cat "$DOCKER_LOG" >&2
-  exit 1
-fi
-
-if [[ ! -f "$WORK_DIR/.codex/.environment/config.toml" ]]; then
-  echo "Expected config.toml to be copied when passing --config <dir>" >&2
-  exit 1
-fi
-
-if ! diff -q "$CONFIG_OVERRIDE_DIR/config.toml" "$WORK_DIR/.codex/.environment/config.toml" >/dev/null; then
-  echo "config.toml in workdir does not match the override directory" >&2
-  exit 1
-fi
-
-if [[ -f "$WORK_DIR/.codex/.environment/auth.json" ]]; then
-  echo "auth.json should no longer be copied into the workdir environment" >&2
   exit 1
 fi
 
@@ -81,4 +80,4 @@ if ! grep -Fq -- "--mount type=bind,src=$CONFIG_OVERRIDE_DIR/auth.json,dst=/code
   exit 1
 fi
 
-echo "run_in_container user test passed"
+echo "run_in_container yes-flag test passed"

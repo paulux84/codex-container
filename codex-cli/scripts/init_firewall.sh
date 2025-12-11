@@ -2,7 +2,7 @@
 set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
 IFS=$'\n\t'       # Stricter word splitting
 
-for cmd in iptables ip6tables dig curl; do
+for cmd in iptables ip6tables ipset dig curl; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "ERROR: Required command '$cmd' not found in PATH" >&2
     exit 1
@@ -56,6 +56,26 @@ fi
 RESOLV_CONF_FILE="${RESOLV_CONF_FILE:-/etc/resolv.conf}"
 NAMESERVERS_V4=()
 NAMESERVERS_V6=()
+DEFAULT_NS_V4=("8.8.8.8" "1.1.1.1")
+DEFAULT_NS_V6=("2001:4860:4860::8888" "2001:4860:4860::8844")
+is_private_ipv4() {
+    local ip="$1"
+    local ip_lc="${ip,,}"
+    ip="$ip_lc"
+    [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] || \
+    [[ "$ip" =~ ^127\. ]] || [[ "$ip" =~ ^169\.254\. ]] || [[ "$ip" =~ ^0\. ]] || [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\. ]] || \
+    [[ "$ip" =~ ^192\.0\.0\. ]] || [[ "$ip" =~ ^192\.0\.2\. ]] || [[ "$ip" =~ ^198\.1[8-9]\. ]] || [[ "$ip" =~ ^198\.51\.100\. ]] || \
+    [[ "$ip" =~ ^203\.0\.113\. ]] || [[ "$ip" =~ ^255\.255\.255\.255$ ]]
+}
+
+is_private_ipv6() {
+    local ip="$1"
+    local ip_lc="${ip,,}"
+    ip="$ip_lc"
+    [[ "$ip" =~ ^(::1|::)$ ]] || [[ "$ip" =~ ^fc|^fd ]] || [[ "$ip" =~ ^fe80 ]] || [[ "$ip" =~ ^ff ]] || \
+    [[ "$ip" =~ ^2001:db8: ]] || [[ "$ip" =~ ^2001:10: ]] || [[ "$ip" =~ ^64:ff9b:: ]] # documentation/ula/link-local/mcast/well-known
+}
+
 if [ -f "$RESOLV_CONF_FILE" ]; then
     while read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -64,8 +84,16 @@ if [ -f "$RESOLV_CONF_FILE" ]; then
         if [[ "$line" =~ ^nameserver[[:space:]]+ ]]; then
             ns=$(awk '{print $2}' <<< "$line")
             if [[ "$ns" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                if is_private_ipv4 "$ns"; then
+                    echo "Skipping private/reserved IPv4 resolver $ns"
+                    continue
+                fi
                 NAMESERVERS_V4+=("$ns")
             elif [[ "$ns" =~ ^[0-9a-fA-F:]+$ ]]; then
+                if is_private_ipv6 "$ns"; then
+                    echo "Skipping private/reserved IPv6 resolver $ns"
+                    continue
+                fi
                 NAMESERVERS_V6+=("$ns")
             fi
         fi
@@ -73,9 +101,66 @@ if [ -f "$RESOLV_CONF_FILE" ]; then
 fi
 
 if [ ${#NAMESERVERS_V4[@]} -eq 0 ] && [ ${#NAMESERVERS_V6[@]} -eq 0 ]; then
-    echo "ERROR: No nameservers found in $RESOLV_CONF_FILE"
-    exit 1
+    echo "No public nameservers found in $RESOLV_CONF_FILE, falling back to default public resolvers."
+    NAMESERVERS_V4=("${DEFAULT_NS_V4[@]}")
+    NAMESERVERS_V6=("${DEFAULT_NS_V6[@]}")
 fi
+
+ipset create allowed-domains hash:net -exist
+ipset create allowed-domains6 hash:net family inet6 -exist
+
+add_ip_if_public() {
+    local ip="$1" domain="$2" family="$3"
+    if [[ "$family" == "ipv4" ]]; then
+        if is_private_ipv4 "$ip"; then
+            echo "Skipping private/reserved IPv4 $ip for $domain"
+            return 1
+        fi
+        ipset add -exist allowed-domains "$ip"
+    else
+        if is_private_ipv6 "$ip"; then
+            echo "Skipping private/reserved IPv6 $ip for $domain"
+            return 1
+        fi
+        ipset add -exist allowed-domains6 "$ip"
+    fi
+    echo "Adding $ip for $domain"
+    return 0
+}
+
+is_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_ipv6() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
+}
+
+for domain in "${ALLOWED_DOMAINS[@]}"; do
+    have_public=false
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        is_ipv4 "$ip" || continue
+        if add_ip_if_public "$ip" "$domain" "ipv4"; then
+            have_public=true
+        fi
+    done < <(dig +short A "$domain")
+
+    while IFS= read -r ip6; do
+        [[ -z "$ip6" ]] && continue
+        is_ipv6 "$ip6" || continue
+        if add_ip_if_public "$ip6" "$domain" "ipv6"; then
+            have_public=true
+        fi
+    done < <(dig +short AAAA "$domain")
+
+    if [[ "$have_public" == "false" ]]; then
+        echo "ERROR: All IPs for $domain filtered as private/reserved"
+        exit 1
+    fi
+done
 
 ensure_container_env() {
     if [[ "${INIT_FIREWALL_SKIP_CONTAINER_CHECK:-0}" == "1" ]]; then

@@ -32,7 +32,7 @@ Le copie originali in `original_codex/` e `other_implementation_example/` sono d
 - Nome container derivato dalla workdir (sanitizzata); `cleanup()` e `trap EXIT` per rimozione container.
 - Montaggi:
   - `WORK_DIR` host su `/app$WORK_DIR` nel container.
-  - Config Codex host: default `$HOME/.codex` (sovrascrivibile con `CODEX_CONFIG_DIR`), poi fallback `~/.config/codex`, altrimenti cartella `codex/` nella workdir (es. contenente `auth.json`), montata su `/codex_home` con `CODEX_HOME=/codex_home`.
+  - Config Codex host: default `$HOME/.codex` (sovrascrivibile con `CODEX_CONFIG_DIR`), poi fallback `~/.config/codex`, altrimenti cartella `codex/` nella workdir (es. contenente `auth.json`); la directory risultante viene montata su `/codex_home` con `CODEX_HOME=/codex_home` mentre `auth.json` viene montato in sola lettura dal suo percorso originale (o da `--auth_file`/`CODEX_AUTH_FILE`) senza copiarlo nella workdir.
   - Directory ambiente: la cartella `WORK_DIR/.codex/.environment` (o il path scelto con `--codex-home <path>/.environment`; se il path è fuori workdir viene chiesta conferma) viene creata sul host e usata come posizione standard per file e download relativi all'ambiente; all'interno del container è esposta come `/codex_home` e resa disponibile agli script tramite la variabile `SANDBOX_ENV_DIR`.
   - Rete / firewall:
     - Avvio container con `--cap-add=NET_ADMIN` e `--cap-add=NET_RAW`.

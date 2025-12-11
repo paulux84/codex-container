@@ -13,9 +13,11 @@ OPENAI_ALLOWED_DOMAINS_ENV="${OPENAI_ALLOWED_DOMAINS-}"
 OPENAI_ALLOWED_DOMAINS=""
 INIT_SCRIPT=""
 READ_ONLY_PATHS=()
+AUTO_CONFIRM=0
 CONFIG_OVERRIDE_FILE=""
 SESSIONS_PATH=""
 CODEX_DATA_DIR="${CODEX_DATA_DIR:-}"
+AUTH_FILE_PATH="${CODEX_AUTH_FILE:-}"
 WORKDIR_CODEX_DIR=""
 CONFIG_SOURCE_DIR=""
 HOST_ALLOWED_DOMAINS_FILE=""
@@ -170,6 +172,14 @@ while [[ $# -gt 0 ]]; do
       CODEX_VERSION="$2"
       shift 2
       ;;
+    --auth_file|--auth-file)
+      if [[ -z "${2-}" ]]; then
+        echo "Error: --auth_file flag provided but no path specified."
+        exit 1
+      fi
+      AUTH_FILE_PATH="$2"
+      shift 2
+      ;;
     --read-only)
       if [[ -z "${2-}" ]]; then
         echo "Error: --read-only flag provided but no path specified."
@@ -201,6 +211,10 @@ while [[ $# -gt 0 ]]; do
       fi
       CODEX_DATA_DIR="$2"
       shift 2
+      ;;
+    -y|--yes)
+      AUTO_CONFIRM=1
+      shift
       ;;
     --)
       shift
@@ -259,7 +273,9 @@ if [[ -n "$CODEX_DATA_DIR" ]]; then
   if [[ "$CODEX_DATA_DIR" != "$WORK_DIR"/* ]]; then
     echo "Warning: codex home is outside the workdir and will be mounted writable in the container: $CODEX_DATA_DIR"
     echo "This exposes that host path to writes from inside the container (breaks strict workdir-only isolation)."
-    if [ -t 0 ]; then
+    if [[ "$AUTO_CONFIRM" == "1" ]]; then
+      echo "Auto-confirming external codex home mount due to -y/--yes."
+    elif [ -t 0 ]; then
       read -r -p "Proceed with mounting codex home outside workdir? This will expose $CODEX_DATA_DIR to writes from the container. [y/N] " confirm_codex_home
       if [[ ! "$confirm_codex_home" =~ ^[Yy]$ ]]; then
         echo "Aborting per user choice."
@@ -385,6 +401,13 @@ copy_if_missing() {
   fi
 }
 
+set_auth_file_if_empty() {
+  local candidate="$1"
+  if [[ -z "$AUTH_FILE_PATH" && -f "$candidate" ]]; then
+    AUTH_FILE_PATH="$candidate"
+  fi
+}
+
 CODEX_HOME_DIR="$ENV_DIR"
 mkdir -p "$CODEX_HOME_DIR"
 
@@ -407,17 +430,15 @@ if [[ -n "$CONFIG_OVERRIDE_FILE" ]]; then
   fi
 
   CONFIG_OVERRIDE_DIR="$(dirname "$CONFIG_OVERRIDE_PATH")"
-  if [[ -f "$CONFIG_OVERRIDE_DIR/auth.json" ]]; then
-    if ! cp "$CONFIG_OVERRIDE_DIR/auth.json" "$CODEX_HOME_DIR/auth.json"; then
-      echo "Error: failed to copy auth.json from --config directory into $CODEX_HOME_DIR"
-      exit 1
-    fi
-  fi
+  set_auth_file_if_empty "$CONFIG_OVERRIDE_DIR/auth.json"
 else
   if [[ -n "$CONFIG_SOURCE_DIR" ]]; then
     copy_if_missing "$CONFIG_SOURCE_DIR/config.toml" "$CODEX_HOME_DIR/config.toml"
-    copy_if_missing "$CONFIG_SOURCE_DIR/auth.json" "$CODEX_HOME_DIR/auth.json"
   fi
+fi
+
+if [[ -z "$AUTH_FILE_PATH" && -n "$CONFIG_SOURCE_DIR" ]]; then
+  set_auth_file_if_empty "$CONFIG_SOURCE_DIR/auth.json"
 fi
 
 secure_if_exists() {
@@ -427,8 +448,28 @@ secure_if_exists() {
   fi
 }
 
+if [[ -z "$AUTH_FILE_PATH" && -f "$CODEX_HOME_DIR/auth.json" ]]; then
+  AUTH_FILE_PATH="$CODEX_HOME_DIR/auth.json"
+fi
+
+if [[ -n "$AUTH_FILE_PATH" ]]; then
+  if [[ ! -f "$AUTH_FILE_PATH" ]]; then
+    echo "Error: auth file not found: $AUTH_FILE_PATH"
+    exit 1
+  fi
+  if ! AUTH_FILE_PATH=$(realpath "$AUTH_FILE_PATH"); then
+    echo "Error: Unable to resolve auth file path."
+    exit 1
+  fi
+else
+  echo "Warning: auth.json not found; Codex CLI may prompt for login inside the container."
+fi
+
 secure_if_exists "$CODEX_HOME_DIR/config.toml"
 secure_if_exists "$CODEX_HOME_DIR/auth.json"
+if [[ -n "$AUTH_FILE_PATH" ]]; then
+  secure_if_exists "$AUTH_FILE_PATH"
+fi
 
 if [[ -d "$WORK_DIR/.git" ]] && command -v git >/dev/null 2>&1; then
   if ! git -C "$WORK_DIR" check-ignore -q "${ENV_DIR#$WORK_DIR/}"; then
@@ -449,7 +490,9 @@ fi
 if [[ "$SESSIONS_PATH_ABS" != "$WORK_DIR"/* ]]; then
   echo "Warning: sessions path is outside the workdir and will be mounted writable in the container: $SESSIONS_PATH_ABS"
   echo "This exposes that host path to writes from inside the container (breaks strict workdir-only isolation)."
-  if [ -t 0 ]; then
+  if [[ "$AUTO_CONFIRM" == "1" ]]; then
+    echo "Auto-confirming external sessions mount due to -y/--yes."
+  elif [ -t 0 ]; then
     read -r -p "Proceed with mounting sessions path outside workdir? This will expose $SESSIONS_PATH_ABS to writes from the container. [y/N] " confirm_sessions
     if [[ ! "$confirm_sessions" =~ ^[Yy]$ ]]; then
       echo "Aborting per user choice."
@@ -520,9 +563,13 @@ visible_hostname codex-squid
 acl allowed_sites dstdomain "/etc/codex/allowed_domains.txt"
 acl CONNECT method CONNECT
 acl SSL_ports port 443
+acl blocked_ipv4 dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/3
+acl blocked_ipv6 dst ::1/128 fc00::/7 fe80::/10 2001:db8::/32 2001:10::/28 ff00::/8
 
 http_access deny CONNECT !SSL_ports
 http_access deny CONNECT !allowed_sites
+http_access deny blocked_ipv4
+http_access deny blocked_ipv6
 http_access allow CONNECT allowed_sites
 http_access allow allowed_sites
 http_access deny all
@@ -591,6 +638,15 @@ DOCKER_RUN_ARGS=(
 DOCKER_RUN_ARGS+=(-v "$CODEX_HOME_DIR:/codex_home")
 DOCKER_RUN_ARGS+=(-e "CODEX_HOME=/codex_home")
 DOCKER_RUN_ARGS+=(--mount "type=bind,src=$SESSIONS_PATH_ABS,dst=/codex_home/sessions")
+
+AUTH_FILE_MOUNT_PATH=""
+if [[ -n "$AUTH_FILE_PATH" && "$AUTH_FILE_PATH" != "$CODEX_HOME_DIR/auth.json" ]]; then
+  AUTH_FILE_MOUNT_PATH="$AUTH_FILE_PATH"
+fi
+
+if [[ -n "$AUTH_FILE_MOUNT_PATH" ]]; then
+  DOCKER_RUN_ARGS+=(--mount "type=bind,src=$AUTH_FILE_MOUNT_PATH,dst=/codex_home/auth.json,ro")
+fi
 
 if [[ -n "$PROXY_URL" ]]; then
   DOCKER_RUN_ARGS+=(-e "HTTP_PROXY=$PROXY_URL" -e "HTTPS_PROXY=$PROXY_URL" -e "NO_PROXY=$PROXY_NO_PROXY")

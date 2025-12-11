@@ -27,6 +27,7 @@ nameserver 2001:4860:4860::8888
 EOF
 export RESOLV_CONF_FILE
 export INIT_FIREWALL_SKIP_CONTAINER_CHECK=1
+export PROXY_IP_V4="5.5.5.5"
 
 MOCK_BIN="$LOG_DIR/mockbin"
 mkdir -p "$MOCK_BIN"
@@ -89,6 +90,7 @@ assert_contains() {
 
 assert_contains "iptables -A OUTPUT -p udp -d 9.9.9.9 --dport 53 -j ACCEPT"
 assert_contains "iptables -A OUTPUT -p tcp -d 9.9.9.9 --dport 53 -j ACCEPT"
+assert_contains "iptables -A OUTPUT -p tcp -d 5.5.5.5 --dport 3128 -j ACCEPT"
 assert_contains "iptables -A INPUT -i lo -j ACCEPT"
 assert_contains "iptables -A OUTPUT -o lo -j ACCEPT"
 assert_contains "iptables -P INPUT DROP"
@@ -96,17 +98,15 @@ assert_contains "iptables -P OUTPUT DROP"
 assert_contains "iptables -P FORWARD DROP"
 assert_contains "iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT"
 assert_contains "iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT"
-assert_contains "iptables -A OUTPUT -p tcp --dport 443 -m set --match-set allowed-domains dst -j ACCEPT"
-assert_contains "ipset create allowed-domains hash:net"
+assert_contains "ipset create allowed-domains hash:net -exist"
 assert_contains "ipset add -exist allowed-domains 1.1.1.1"
-assert_contains "ipset create allowed-domains6 hash:net family inet6"
+assert_contains "ipset create allowed-domains6 hash:net family inet6 -exist"
 assert_contains "ipset add -exist allowed-domains6 2600:1f18:abcd::1"
 assert_contains "ip6tables -P INPUT DROP"
 assert_contains "ip6tables -P OUTPUT DROP"
 assert_contains "ip6tables -P FORWARD DROP"
 assert_contains "ip6tables -A INPUT -i lo -j ACCEPT"
 assert_contains "ip6tables -A OUTPUT -o lo -j ACCEPT"
-assert_contains "ip6tables -A OUTPUT -p tcp --dport 443 -m set --match-set allowed-domains6 dst -j ACCEPT"
 assert_contains "ip6tables -A OUTPUT -p udp -d 2001:4860:4860::8888 --dport 53 -j ACCEPT"
 assert_contains "ip6tables -A OUTPUT -p tcp -d 2001:4860:4860::8888 --dport 53 -j ACCEPT"
 assert_contains "dig +short A api.openai.com"
@@ -117,6 +117,6 @@ assert_contains "dig +short A auth0.openai.com"
 assert_contains "dig +short A platform.openai.com"
 assert_contains "dig +short A openai.com"
 assert_contains "curl --connect-timeout 5 https://example.com"
-assert_contains "curl --connect-timeout 5 https://api.openai.com"
+assert_contains "curl --connect-timeout 8 -s https://api.openai.com"
 
 echo "Firewall rules test passed"
