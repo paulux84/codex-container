@@ -314,8 +314,8 @@ for path in "${READ_ONLY_PATHS[@]}"; do
     echo "Error: Read-only path does not exist: $path"
     exit 1
   fi
-  if [[ "$abs_path" != "$WORK_DIR"/* ]]; then
-    echo "Error: refusing to mount read-only path outside workdir: $abs_path"
+  if [[ "$abs_path" == "/" ]]; then
+    echo "Error: refusing to mount read-only path at root (/) to avoid exposing the entire host filesystem."
     exit 1
   fi
   READ_ONLY_PATHS_ABS+=("$abs_path")
@@ -632,6 +632,10 @@ proxy=$PROXY_URL
 https-proxy=$PROXY_URL
 noproxy=$PROXY_NO_PROXY
 EOF
+
+//TODO
+//this can be used instead of .npmrc for mcp server... env = { HTTP_PROXY = "$HTTP_PROXY", HTTPS_PROXY = "$HTTPS_PROXY", NO_PROXY = "$NO_PROXY" }
+
 
 DOCKER_RUN_ARGS=(
   --name "$CONTAINER_NAME"
