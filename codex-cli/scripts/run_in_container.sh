@@ -304,6 +304,16 @@ PROXY_URL_V4=""
 PROXY_URL_V6=""
 PROXY_URL=""
 
+# Idempotently set a key=value pair in an ini-style file (like .npmrc)
+set_kv_if_needed() {
+  local file="$1" key="$2" value="$3"
+  if grep -qE "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s#^${key}=.*#${key}=${value//#/\\#}#" "$file"
+  else
+    printf '%s\n' "${key}=${value}" >>"$file"
+  fi
+}
+
 READ_ONLY_PATHS_ABS=()
 for path in "${READ_ONLY_PATHS[@]}"; do
   if ! abs_path=$(realpath "$path"); then
@@ -314,8 +324,8 @@ for path in "${READ_ONLY_PATHS[@]}"; do
     echo "Error: Read-only path does not exist: $path"
     exit 1
   fi
-  if [[ "$abs_path" != "$WORK_DIR"/* ]]; then
-    echo "Error: refusing to mount read-only path outside workdir: $abs_path"
+  if [[ "$abs_path" == "/" ]]; then
+    echo "Error: refusing to mount read-only path at root (/) to avoid exposing the entire host filesystem."
     exit 1
   fi
   READ_ONLY_PATHS_ABS+=("$abs_path")
@@ -615,6 +625,14 @@ if [[ -z "$PROXY_URL" ]]; then
   exit 1
 fi
 
+# Preconfigure npm for the codex user so subprocesses (e.g., MCP servers) use the proxy
+NPMRC_PATH="$CODEX_HOME_DIR/.npmrc"
+mkdir -p "$(dirname "$NPMRC_PATH")"
+touch "$NPMRC_PATH"
+set_kv_if_needed "$NPMRC_PATH" "proxy" "$PROXY_URL"
+set_kv_if_needed "$NPMRC_PATH" "https-proxy" "$PROXY_URL"
+set_kv_if_needed "$NPMRC_PATH" "noproxy" "${PROXY_NO_PROXY}"
+
 PROXY_CONFIG_FILE="$ALLOWED_DOMAINS_DIR/proxy.conf"
 {
   if [[ -n "$PROXY_IP_V4" ]]; then
@@ -625,6 +643,19 @@ PROXY_CONFIG_FILE="$ALLOWED_DOMAINS_DIR/proxy.conf"
   fi
   echo "PROXY_PORT=$PROXY_PORT"
 } >"$PROXY_CONFIG_FILE"
+
+# Create a proxy-wrapping npx shim so MCP commands see proxy env even if their env is sanitized
+WRAPPER_BIN_DIR="$CODEX_HOME_DIR/bin"
+mkdir -p "$WRAPPER_BIN_DIR"
+NPX_WRAPPER="$WRAPPER_BIN_DIR/npx"
+cat >"$NPX_WRAPPER" <<EOF
+#!/bin/bash
+export HTTP_PROXY="${PROXY_URL}"
+export HTTPS_PROXY="${PROXY_URL}"
+export NO_PROXY="${PROXY_NO_PROXY}"
+exec /usr/bin/env npx "\$@"
+EOF
+chmod +x "$NPX_WRAPPER"
 
 DOCKER_RUN_ARGS=(
   --name "$CONTAINER_NAME"
@@ -638,6 +669,8 @@ DOCKER_RUN_ARGS=(
 DOCKER_RUN_ARGS+=(-v "$CODEX_HOME_DIR:/codex_home")
 DOCKER_RUN_ARGS+=(-e "CODEX_HOME=/codex_home")
 DOCKER_RUN_ARGS+=(--mount "type=bind,src=$SESSIONS_PATH_ABS,dst=/codex_home/sessions")
+# Bind the npx proxy shim into a standard PATH location
+DOCKER_RUN_ARGS+=(--mount "type=bind,src=$NPX_WRAPPER,dst=/usr/local/bin/npx,ro")
 
 AUTH_FILE_MOUNT_PATH=""
 if [[ -n "$AUTH_FILE_PATH" && "$AUTH_FILE_PATH" != "$CODEX_HOME_DIR/auth.json" ]]; then
@@ -651,6 +684,10 @@ fi
 if [[ -n "$PROXY_URL" ]]; then
   DOCKER_RUN_ARGS+=(-e "HTTP_PROXY=$PROXY_URL" -e "HTTPS_PROXY=$PROXY_URL" -e "NO_PROXY=$PROXY_NO_PROXY")
 fi
+# Prepend wrapper bin dir so MCP \"npx\" resolves to proxy-aware shim; keep Codex/npx global bin path
+DOCKER_RUN_ARGS+=(-e "PATH=$WRAPPER_BIN_DIR:/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+# Ensure npm inside the container uses the shared npmrc (even if env is sanitized)
+DOCKER_RUN_ARGS+=(-e "NPM_CONFIG_USERCONFIG=/codex_home/.npmrc" -e "npm_config_userconfig=/codex_home/.npmrc")
 
 for ro_path in "${READ_ONLY_PATHS_ABS[@]}"; do
   DOCKER_RUN_ARGS+=(--mount "type=bind,src=$ro_path,dst=/app$ro_path,ro")
@@ -680,6 +717,12 @@ if [[ $firewall_status -ne 0 ]]; then
   fi
   exit $firewall_status
 fi
+
+# Mirror the npm configuration into locations that npm reads even with a sanitized env
+docker exec --user root "$CONTAINER_NAME" bash -c "\
+  cp /codex_home/.npmrc /home/codex/.npmrc && chown codex:codex /home/codex/.npmrc && \
+  cp /codex_home/.npmrc /etc/npmrc && \
+  mkdir -p /usr/local/etc && cp /codex_home/.npmrc /usr/local/etc/npmrc" >/dev/null 2>&1 || true
 
 # Quote Codex args (if any)
 quoted_args=""

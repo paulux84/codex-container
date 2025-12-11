@@ -244,7 +244,15 @@ Lo script:
   - filtra gli IP privati/riservati dalle risoluzioni DNS (10/8, 172.16/12, 192.168/16, 169.254/16, 127/8, 0.0.0.0/8, broadcast; ::1, fe80::/10, ff00::/8) e fallisce se restano solo quelli (override opt-in: `ALLOW_PRIVATE_DNS=1`);
   - configura iptables/ipset;
   - verifica che `https://example.com` sia **bloccato** e `https://api.openai.com` **raggiungibile**.
-  - blocca la rete locale/gateway (resta permesso solo il loopback e i domini whitelisted).
+- blocca la rete locale/gateway (resta permesso solo il loopback e i domini whitelisted).
+
+## Sicurezza della rete e firewall
+
+- il firewall di `init_firewall.sh` impone policy `DROP` per INPUT/OUTPUT/FORWARD e consente in uscita solo il traffico verso il proxy (Squid interno oppure un proxy esterno configurato con `PROXY_IP_V4/PROXY_IP_V6` e `PROXY_PORT`) e solo il DNS verso i risolutori pubblici, così nessuna connessione diretta può raggiungere internet senza passare dal proxy.
+- Squid, quando avviato automaticamente, si collega alla rete dedicata `codex_net_*` e applica ACL `allowed_sites` basati su `allowed_domains.txt` (merge di domini OpenAI di default + overrides/ENV). I blocchi sono completi: vietati metodi CONNECT verso blacklisted, vietate reti private IPv4/v6 e tutto il resto è negato.
+- il loopback (`-i lo`/`-o lo`) e le connessioni ESTABLISHED/RELATED restano aperte, quindi i processi nel container possono ancora comunicare tra loro e con servizi locali senza interferenze.
+- è possibile abilitare l’ACL addizionale via `INIT_FIREWALL_ENABLE_DOMAIN_ACL=1`: vengono popolati gli ipset `allowed-domains` e `allowed-domains6` con solo IP pubblici derivati dai domini autorizzati e il proxy può usarli come filtro extra.
+- il container Codex stesso viene eseguito con `--cap-drop=ALL`, `--security-opt no-new-privileges` e senza NET_ADMIN; le regole iptables sono applicate da un container separato con capacità `NET_ADMIN`/`NET_RAW` che condivide la network namespace (`docker run --network container:$CONTAINER_NAME`). `init_firewall.sh` rifiuta di girare al di fuori di un namespace container-validato, quindi Codex non può modificare o disabilitare manualmente il firewall.
 
 ### `CODEX_CONFIG_DIR`
 
@@ -329,10 +337,10 @@ Lo script di esempio `sandbox-setup.sh` è idempotente: se trova `requirements.t
 
 ## Test firewall rules
 
-`tests/test_firewall_rules.sh` simula l’esecuzione di `init_firewall.sh` con binari mockati e verifica che:
+`tests/test_firewall_rules.sh` simula l’esecuzione di `init_firewall.sh` con binari mockati (con `INIT_FIREWALL_ENABLE_DOMAIN_ACL=1`) e verifica che:
 
 - loopback e DNS siano sempre aperti;
-- i domini di `OPENAI_ALLOWED_DOMAINS` vengano risolti e aggiunti all’ipset `allowed-domains`;
+- i domini di `OPENAI_ALLOWED_DOMAINS` vengano risolti e aggiunti all’ipset `allowed-domains` (feature legacy, ora opzionale via `INIT_FIREWALL_ENABLE_DOMAIN_ACL=1`; default 0 se il proxy esterno applica già l’ACL);
 - le policy predefinite siano DROP tranne il traffico verso gli IP autorizzati;
 - `https://example.com` sia respinto e `https://api.openai.com` raggiungibile.
 

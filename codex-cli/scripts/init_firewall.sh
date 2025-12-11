@@ -2,7 +2,14 @@
 set -euo pipefail  # Exit on error, undefined vars, and pipeline failures
 IFS=$'\n\t'       # Stricter word splitting
 
-for cmd in iptables ip6tables ipset dig curl; do
+INIT_FIREWALL_ENABLE_DOMAIN_ACL="${INIT_FIREWALL_ENABLE_DOMAIN_ACL:-0}"  # 1 to build ipset of allowed domains (legacy)
+
+required_cmds=(iptables ip6tables curl)
+if [[ "$INIT_FIREWALL_ENABLE_DOMAIN_ACL" == "1" ]]; then
+  required_cmds+=(ipset dig)
+fi
+
+for cmd in "${required_cmds[@]}"; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "ERROR: Required command '$cmd' not found in PATH" >&2
     exit 1
@@ -30,27 +37,29 @@ if ! [[ "$PROXY_PORT" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-# Domains file (used by the proxy ACL, not by iptables)
-DEFAULT_ALLOWED_DOMAINS=(
-    "api.openai.com"
-    "chat.openai.com"
-    "chatgpt.com"
-    "auth0.openai.com"
-    "platform.openai.com"
-    "openai.com"
-)
+if [[ "$INIT_FIREWALL_ENABLE_DOMAIN_ACL" == "1" ]]; then
+    # Domains file (used by the proxy ACL, not by iptables)
+    DEFAULT_ALLOWED_DOMAINS=(
+        "api.openai.com"
+        "chat.openai.com"
+        "chatgpt.com"
+        "auth0.openai.com"
+        "platform.openai.com"
+        "openai.com"
+    )
 
-ALLOWED_DOMAINS_FILE="${ALLOWED_DOMAINS_FILE:-/etc/codex/allowed_domains.txt}"
-if [ -f "$ALLOWED_DOMAINS_FILE" ]; then
-    mapfile -t ALLOWED_DOMAINS < <(grep -v '^[[:space:]]*#' "$ALLOWED_DOMAINS_FILE" | sed '/^[[:space:]]*$/d')
-    if [ ${#ALLOWED_DOMAINS[@]} -eq 0 ]; then
-        echo "ERROR: Allowed domains file is empty after filtering comments/blank lines: $ALLOWED_DOMAINS_FILE" >&2
-        exit 1
+    ALLOWED_DOMAINS_FILE="${ALLOWED_DOMAINS_FILE:-/etc/codex/allowed_domains.txt}"
+    if [ -f "$ALLOWED_DOMAINS_FILE" ]; then
+        mapfile -t ALLOWED_DOMAINS < <(grep -v '^[[:space:]]*#' "$ALLOWED_DOMAINS_FILE" | sed '/^[[:space:]]*$/d')
+        if [ ${#ALLOWED_DOMAINS[@]} -eq 0 ]; then
+            echo "ERROR: Allowed domains file is empty after filtering comments/blank lines: $ALLOWED_DOMAINS_FILE" >&2
+            exit 1
+        fi
+        echo "Using domains from file (for proxy ACL): ${ALLOWED_DOMAINS[*]}"
+    else
+        ALLOWED_DOMAINS=("${DEFAULT_ALLOWED_DOMAINS[@]}")
+        echo "Domains file not found, falling back to default (for proxy ACL): ${ALLOWED_DOMAINS[*]}"
     fi
-    echo "Using domains from file (for proxy ACL): ${ALLOWED_DOMAINS[*]}"
-else
-    ALLOWED_DOMAINS=("${DEFAULT_ALLOWED_DOMAINS[@]}")
-    echo "Domains file not found, falling back to default (for proxy ACL): ${ALLOWED_DOMAINS[*]}"
 fi
 
 RESOLV_CONF_FILE="${RESOLV_CONF_FILE:-/etc/resolv.conf}"
@@ -106,61 +115,65 @@ if [ ${#NAMESERVERS_V4[@]} -eq 0 ] && [ ${#NAMESERVERS_V6[@]} -eq 0 ]; then
     NAMESERVERS_V6=("${DEFAULT_NS_V6[@]}")
 fi
 
-ipset create allowed-domains hash:net -exist
-ipset create allowed-domains6 hash:net family inet6 -exist
+if [[ "$INIT_FIREWALL_ENABLE_DOMAIN_ACL" == "1" ]]; then
+    ipset create allowed-domains hash:net -exist
+    ipset create allowed-domains6 hash:net family inet6 -exist
 
-add_ip_if_public() {
-    local ip="$1" domain="$2" family="$3"
-    if [[ "$family" == "ipv4" ]]; then
-        if is_private_ipv4 "$ip"; then
-            echo "Skipping private/reserved IPv4 $ip for $domain"
-            return 1
+    add_ip_if_public() {
+        local ip="$1" domain="$2" family="$3"
+        if [[ "$family" == "ipv4" ]]; then
+            if is_private_ipv4 "$ip"; then
+                echo "Skipping private/reserved IPv4 $ip for $domain"
+                return 1
+            fi
+            ipset add -exist allowed-domains "$ip"
+        else
+            if is_private_ipv6 "$ip"; then
+                echo "Skipping private/reserved IPv6 $ip for $domain"
+                return 1
+            fi
+            ipset add -exist allowed-domains6 "$ip"
         fi
-        ipset add -exist allowed-domains "$ip"
-    else
-        if is_private_ipv6 "$ip"; then
-            echo "Skipping private/reserved IPv6 $ip for $domain"
-            return 1
+        echo "Adding $ip for $domain"
+        return 0
+    }
+
+    is_ipv4() {
+        local ip="$1"
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+    }
+
+    is_ipv6() {
+        local ip="$1"
+        [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
+    }
+
+    for domain in "${ALLOWED_DOMAINS[@]}"; do
+        have_public=false
+        while IFS= read -r ip; do
+            [[ -z "$ip" ]] && continue
+            is_ipv4 "$ip" || continue
+            if add_ip_if_public "$ip" "$domain" "ipv4"; then
+                have_public=true
+            fi
+        done < <(dig +short A "$domain")
+
+        while IFS= read -r ip6; do
+            [[ -z "$ip6" ]] && continue
+            is_ipv6 "$ip6" || continue
+            if add_ip_if_public "$ip6" "$domain" "ipv6"; then
+                have_public=true
+            fi
+        done < <(dig +short AAAA "$domain")
+
+        if [[ "$have_public" == "false" ]]; then
+            echo "ERROR: All IPs for $domain filtered as private/reserved"
+            exit 1
         fi
-        ipset add -exist allowed-domains6 "$ip"
-    fi
-    echo "Adding $ip for $domain"
-    return 0
-}
-
-is_ipv4() {
-    local ip="$1"
-    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
-}
-
-is_ipv6() {
-    local ip="$1"
-    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
-}
-
-for domain in "${ALLOWED_DOMAINS[@]}"; do
-    have_public=false
-    while IFS= read -r ip; do
-        [[ -z "$ip" ]] && continue
-        is_ipv4 "$ip" || continue
-        if add_ip_if_public "$ip" "$domain" "ipv4"; then
-            have_public=true
-        fi
-    done < <(dig +short A "$domain")
-
-    while IFS= read -r ip6; do
-        [[ -z "$ip6" ]] && continue
-        is_ipv6 "$ip6" || continue
-        if add_ip_if_public "$ip6" "$domain" "ipv6"; then
-            have_public=true
-        fi
-    done < <(dig +short AAAA "$domain")
-
-    if [[ "$have_public" == "false" ]]; then
-        echo "ERROR: All IPs for $domain filtered as private/reserved"
-        exit 1
-    fi
-done
+    done
+else
+    echo "Skipping domain ACL/ipset setup (INIT_FIREWALL_ENABLE_DOMAIN_ACL=0)"
+fi
 
 ensure_container_env() {
     if [[ "${INIT_FIREWALL_SKIP_CONTAINER_CHECK:-0}" == "1" ]]; then
