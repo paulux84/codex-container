@@ -537,6 +537,17 @@ fi
 # Container name derived from sanitized workdir path
 CONTAINER_NAME="codex_$(echo "$WORK_DIR" | sed 's:/:_:g' | sed 's/[^a-zA-Z0-9_-]//g')"
 
+dump_squid_logs() {
+  if [[ "$FIREWALL_MODE" == "proxy" && -n "$SQUID_CONTAINER_NAME" ]]; then
+    echo "--- Squid logs ($SQUID_CONTAINER_NAME, last 200 lines) ---"
+    # Prefer the access.log inside the container (complete history), fall back to docker logs
+    if ! docker exec "$SQUID_CONTAINER_NAME" sh -c 'tail -n 200 /var/log/squid/access.log 2>/dev/null || tail -n 200 /var/log/squid/access.log.1 2>/dev/null' 2>/dev/null; then
+      docker logs --tail=200 "$SQUID_CONTAINER_NAME" 2>/dev/null || true
+    fi
+    echo "--- End Squid logs ---"
+  fi
+}
+
 cleanup() {
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   if [[ -n "$SQUID_CONTAINER_NAME" ]]; then
@@ -552,7 +563,16 @@ cleanup() {
     rm -rf "$SQUID_CONFIG_DIR" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT
+
+on_exit() {
+  local status=$?
+  if [[ "$status" -ne 0 && -z "${SKIP_SQUID_LOG_ON_EXIT:-}" ]]; then
+    dump_squid_logs
+  fi
+  cleanup
+}
+
+trap on_exit EXIT
 
 # Remove any existing container for this workdir
 cleanup
@@ -738,3 +758,12 @@ docker exec --user root "$CONTAINER_NAME" bash -c 'if [ -d /codex_home/bin ]; th
 
 # Launch Codex with a PATH that already includes the mirrored bin directory
 docker exec --user codex "${exec_flags[@]}" "$CONTAINER_NAME" bash -c "export SANDBOX_ENV_DIR=\"/codex_home\"; export CODEX_HOME=\"/codex_home\"; export PATH=\"/codex_home/bin:/usr/local/bin:/usr/local/share/npm-global/bin:/usr/local/sbin:/usr/bin:/bin\"; cd \"/app$WORK_DIR\" && codex --full-auto${quoted_args}"
+codex_status=$?
+
+if [[ $codex_status -ne 0 ]]; then
+  echo "Codex container exited with status $codex_status"
+  dump_squid_logs
+  # Evita una seconda stampa dei log da parte del trap on_exit
+  SKIP_SQUID_LOG_ON_EXIT=1
+  exit "$codex_status"
+fi

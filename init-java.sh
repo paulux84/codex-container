@@ -22,7 +22,6 @@ TOOLS_DIR="$SANDBOX_ENV_DIR/tools"
 JAVA_DIR="$TOOLS_DIR/java-$JAVA_MAJOR_VERSION"
 MAVEN_DIR="$TOOLS_DIR/apache-maven-$MAVEN_VERSION"
 BIN_DIR="$SANDBOX_ENV_DIR/bin"
-#ENV_SNIPPET="$SANDBOX_ENV_DIR/.env_init_java.sh"
 BASHRC_PATH="$SANDBOX_ENV_DIR/.bashrc"
 
 mkdir -p "$TOOLS_DIR" "$BIN_DIR"
@@ -127,6 +126,17 @@ export PATH="$BIN_DIR:$JAVA_DIR/bin:$MAVEN_DIR/bin:$PATH"
 #elif ! grep -Fq '.env_init_java.sh' "$BASHRC_PATH"; then
 #  echo 'source "$HOME/.env_init_java.sh" 2>/dev/null || true' >>"$BASHRC_PATH"
 #fi
+
+mkdir -p /home/codex/.m2
+cat <<EOF > /home/codex/.m2/settings.xml
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
+  <localRepository>/app/home/paolo/.m2/repository</localRepository>
+</settings>
+
+EOF
+
 
 # Verifica finale
 log "java -version:"
