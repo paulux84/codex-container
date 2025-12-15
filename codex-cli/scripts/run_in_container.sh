@@ -458,6 +458,34 @@ if [[ -z "$AUTH_FILE_PATH" && -n "$CONFIG_SOURCE_DIR" ]]; then
   set_auth_file_if_empty "$CONFIG_SOURCE_DIR/auth.json"
 fi
 
+PROMPTS_SOURCE_DIR=""
+PROMPTS_DEST_DIR="$CODEX_HOME_DIR/prompts"
+PROMPTS_SOURCE_DIR_CANDIDATES=()
+
+if [[ -n "${CONFIG_OVERRIDE_DIR:-}" ]]; then
+  PROMPTS_SOURCE_DIR_CANDIDATES+=("$CONFIG_OVERRIDE_DIR")
+fi
+if [[ -n "$CONFIG_SOURCE_DIR" ]]; then
+  PROMPTS_SOURCE_DIR_CANDIDATES+=("$CONFIG_SOURCE_DIR")
+fi
+PROMPTS_SOURCE_DIR_CANDIDATES+=("$CODEX_DATA_DIR")
+
+for candidate in "${PROMPTS_SOURCE_DIR_CANDIDATES[@]}"; do
+  if [[ -d "$candidate/prompts" ]]; then
+    PROMPTS_SOURCE_DIR="$candidate/prompts"
+    break
+  fi
+done
+
+PROMPTS_DEST_DIR="$CODEX_HOME_DIR/prompts"
+if [[ -n "$PROMPTS_SOURCE_DIR" ]]; then
+  mkdir -p "$PROMPTS_DEST_DIR"
+  if ! cp -a -n "$PROMPTS_SOURCE_DIR"/. "$PROMPTS_DEST_DIR"; then
+    echo "Error: failed to copy prompts from $PROMPTS_SOURCE_DIR to $PROMPTS_DEST_DIR"
+    exit 1
+  fi
+fi
+
 secure_if_exists() {
   local file="$1"
   if [[ -f "$file" ]]; then
