@@ -1,6 +1,6 @@
 # Codex Lockbox: Egress‑restricted Sandbox for OpenAI Codex CLI
 
-[![Codex Lockbox Logo](./docs/codex-lockbox-logo.png)](./docs/codex-lockbox-logo.png)
+[![Codex Lockbox Logo](./logo.png)](./logo.png)
 
 Run the **OpenAI Codex CLI** inside a **firewalled sandboxed Docker container** with:
 

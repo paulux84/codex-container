@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Versioni configurabili per Java e Maven
+# Configurable versions for Java and Maven
 JAVA_MAJOR_VERSION="21"
 MAVEN_VERSION="3.9.11"
 
@@ -11,12 +11,12 @@ log() {
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    log "ERROR: comando richiesto non trovato: $1"
+    log "ERROR: required command not found: $1"
     exit 1
   fi
 }
 
-# Directory di lavoro dell'hook nel container (run_in_container.sh esporta SANDBOX_ENV_DIR=/codex_home)
+# Hook working directory inside the container (run_in_container.sh exports SANDBOX_ENV_DIR=/codex_home)
 SANDBOX_ENV_DIR="${SANDBOX_ENV_DIR:-"$PWD/.codex/.environment"}"
 TOOLS_DIR="$SANDBOX_ENV_DIR/tools"
 JAVA_DIR="$TOOLS_DIR/java-$JAVA_MAJOR_VERSION"
@@ -41,7 +41,7 @@ install_java() {
     rm -rf "$JAVA_DIR"
   fi
 
-  # Adoptium build GA per l'architettura x64 Linux
+  # Adoptium GA build for x64 Linux architecture
   JAVA_URL="https://api.adoptium.net/v3/binary/latest/${JAVA_MAJOR_VERSION}/ga/linux/x64/jdk/hotspot/normal/eclipse"
   log "Scarico JDK ${JAVA_MAJOR_VERSION} da $JAVA_URL"
 
@@ -100,15 +100,15 @@ install_maven() {
 install_java
 install_maven
 
-# Esponi i binari anche tramite symlink stabili in $SANDBOX_ENV_DIR/bin
+# Expose the binaries also via stable symlinks in $SANDBOX_ENV_DIR/bin
 ln -sf "$JAVA_DIR/bin/java" "$BIN_DIR/java"
 ln -sf "$JAVA_DIR/bin/javac" "$BIN_DIR/javac"
 ln -sf "$MAVEN_DIR/bin/mvn" "$BIN_DIR/mvn"
 
-# Aggiorna il PATH (anche se il chiamante ha un PATH di default ridotto)
+# Update PATH (even if the caller has a restricted default PATH)
 export PATH="$BIN_DIR:$JAVA_DIR/bin:$MAVEN_DIR/bin:$PATH"
 
-# Rendi l'env persistente per future shell (es. docker exec interattivi)
+# Make the environment persistent for future shells (e.g. interactive docker exec sessions)
 #cat >"$ENV_SNIPPET" <<EOF
 ## shellcheck shell=bash
 #export JAVA_HOME="$JAVA_DIR"
@@ -132,13 +132,13 @@ cat <<EOF > /home/codex/.m2/settings.xml
 <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
           xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
-  <localRepository>/app/home/paolo/.m2/repository</localRepository>
+  <localRepository>/app/home/user/.m2/repository</localRepository>
 </settings>
 
 EOF
 
 
-# Verifica finale
+# Final verification
 log "java -version:"
 java -version 2>&1 || true
 
