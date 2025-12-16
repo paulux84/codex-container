@@ -66,6 +66,7 @@ chmod +x "$MOCK_BIN/curl"
 
 export PATH="$MOCK_BIN:/usr/bin:/bin"
 export INIT_FIREWALL_SKIP_CONTAINER_CHECK=1
+export PROXY_IP_V4="2.2.2.2"
 
 # Test 1: mixed public/private records -> private filtered out, public kept
 echo "good.com" > "$ALLOWED_DOMAINS_FILE"
@@ -104,8 +105,13 @@ if ! grep -q "Adding 1.2.3.4 for good.com" "$LOG"; then
   cat "$LOG" >&2
   exit 1
 fi
-if ! grep -q "Adding 2001:db8::1 for good.com" "$LOG"; then
-  echo "Expected public IPv6 to be allowed" >&2
+if ! grep -q "Skipping private/reserved IPv4 10.0.0.1 for good.com" "$LOG"; then
+  echo "Expected private IPv4 skip message" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+if ! grep -q "Skipping private/reserved IPv6 2001:db8::1 for good.com" "$LOG"; then
+  echo "Expected documentation IPv6 to be skipped" >&2
   cat "$LOG" >&2
   exit 1
 fi
@@ -124,6 +130,30 @@ fi
 
 if ! grep -q "All IPs for private-only.com filtered" "$LOG"; then
   echo "Expected error about filtering all IPs for private-only.com" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+
+# Test 3: resolv.conf with private resolvers -> fallback to defaults (no failure)
+echo "good.com" > "$ALLOWED_DOMAINS_FILE"
+echo "nameserver 10.10.10.53" > "$RESOLV_CONF_FILE"
+: > "$LOG"
+if ! ALLOWED_DOMAINS_FILE="$ALLOWED_DOMAINS_FILE" \
+     RESOLV_CONF_FILE="$RESOLV_CONF_FILE" \
+     bash "$ROOT_DIR/codex-cli/scripts/init_firewall.sh" \
+     >"$LOG" 2>&1; then
+  echo "Expected firewall init to succeed using default public nameservers" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+
+if ! grep -q "Skipping private/reserved IPv4 resolver 10.10.10.53" "$LOG"; then
+  echo "Expected log about skipping private resolver" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+if ! grep -q "falling back to default public resolvers" "$LOG"; then
+  echo "Expected fallback to default nameservers" >&2
   cat "$LOG" >&2
   exit 1
 fi
